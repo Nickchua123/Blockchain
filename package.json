@@ -1,0 +1,21 @@
+{
+  "name": "webbloclchain",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "npm install --prefix be && npm install --prefix fe && npm run build --prefix fe",
+    "start": "npm run start --prefix be"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nickchua123/Blockchain.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Nickchua123/Blockchain/issues"
+  },
+  "homepage": "https://github.com/Nickchua123/Blockchain#readme"
+}
