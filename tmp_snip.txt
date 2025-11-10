@@ -1,0 +1,493 @@
+﻿import { useEffect, useMemo, useState } from "react";
+import {
+  BrowserProvider,
+  Contract,
+  isAddress,
+} from "ethers";
+import contractABI from "../assets/CertificateNFT.json";
+import { toast } from "react-toastify";
+import { useWallet } from "../context/WalletContext";
+
+// Env + contract
+const envVite = (typeof import.meta !== "undefined" && import.meta.env?.VITE_CONTRACT_ADDRESS) || "";
+const envCRA = (typeof process !== "undefined" && process.env?.REACT_APP_CONTRACT_ADDRESS) || "";
+const contractAddress = (envVite || envCRA || "YOUR_CONTRACT_ADDRESS").trim();
+
+const envAdmins = (typeof import.meta !== "undefined" && import.meta.env?.VITE_ADMIN_ADDRESSES) || (typeof process !== "undefined" && process.env?.VITE_ADMIN_ADDRESSES) || "";
+
+// Explorer helper
+function getExplorerBaseByChain(id) {
+  switch (Number(id)) {
+    case 1: return 'https://etherscan.io';
+    case 11155111: return 'https://sepolia.etherscan.io';
+    case 137: return 'https://polygonscan.com';
+    case 80002: return 'https://amoy.polygonscan.com';
+    case 56: return 'https://bscscan.com';
+    case 97: return 'https://testnet.bscscan.com';
+    case 42161: return 'https://arbiscan.io';
+    case 421614: return 'https://sepolia.arbiscan.io';
+    case 8453: return 'https://basescan.org';
+    case 84532: return 'https://sepolia.basescan.org';
+    default: return 'https://etherscan.io';
+  }
+}
+
+// IPFS helpers
+function resolveIpfs(uri) {
+  if (!uri) return "";
+  if (uri.startsWith("ipfs://")) return `https://ipfs.io/ipfs/${uri.replace("ipfs://", "")}`;
+  return uri;
+}
+
+async function fetchJsonWithFallbacks(uri) {
+  try {
+    const apiBase = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE) || '/api';
+    const r = await fetch(`${apiBase}/ipfs/fetch?uri=${encodeURIComponent(uri)}`, {
+      cache: 'no-store',
+      headers: { 'Accept': 'application/json' },
+    });
+    if (r.ok) {
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('application/json')) return await r.json();
+      const text = await r.text();
+      try { return JSON.parse(text); } catch {}
+    }
+  } catch (_) { /* ignore */ }
+
+  const http = resolveIpfs(uri);
+  const pinata = http?.replace("https://ipfs.io/ipfs/", "https://gateway.pinata.cloud/ipfs/");
+  const cf = http?.replace("https://ipfs.io/ipfs/", "https://cloudflare-ipfs.com/ipfs/");
+  const nftst = http?.replace("https://ipfs.io/ipfs/", "https://nftstorage.link/ipfs/");
+  const bases = Array.from(new Set([pinata, http, cf, nftst].filter(Boolean)));
+  const withBust = (u) => u + (u.includes("?") ? "&" : "?") + "ts=" + Date.now();
+  const candidates = bases.flatMap((u) => [u, withBust(u)]);
+
+  let lastError = null;
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, {
+        cache: "no-store",
+        mode: "cors",
+        headers: {
+          "Cache-Control": "no-cache",
+          "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+        },
+      });
+      if (!res.ok) continue;
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (ct.includes("application/json") || ct.includes("ld+json") || ct.includes("text/json")) {
+        return await res.json();
+      }
+      const text = await res.text();
+      try { return JSON.parse(text); } catch {}
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError || new Error("KhÃ´ng thá»ƒ táº£i metadata");
+}
+
+function canonicalizeTokenUri(input) {
+  if (!input) return "";
+  const v = input.trim();
+  if (v.startsWith("ipfs://")) return v;
+  try {
+    const u = new URL(v);
+    const parts = u.pathname.split("/").filter(Boolean);
+    const ipfsIndex = parts.indexOf("ipfs");
+    if (ipfsIndex !== -1 && parts[ipfsIndex + 1]) {
+      return `ipfs://${parts.slice(ipfsIndex + 1).join("/")}`;
+    }
+  } catch {}
+  if (/^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[1-9A-HJ-NP-Za-km-z]{20,})$/.test(v)) {
+    return `ipfs://${v}`;
+  }
+  return v;
+}
+
+export default function MintPage() {
+  const { address: walletAddress, connect, isConnected } = useWallet();
+  const hasValidContract = useMemo(() => {
+    try { return isAddress(contractAddress); } catch { return false; }
+  }, []);
+
+  // Form state
+  const [recipient, setRecipient] = useState("");
+  const [tokenURI, setTokenURI] = useState("");
+  const [jsonFile, setJsonFile] = useState(null);
+  const [imageFile, setImageFile] = useState(null);
+  const [metaName, setMetaName] = useState("");
+  const [metaDescription, setMetaDescription] = useState("");
+  const [metaCourse, setMetaCourse] = useState("");
+  const [metaScore, setMetaScore] = useState("");
+  const [metaDate, setMetaDate] = useState("");
+  const [uploader, setUploader] = useState("nftstorage");
+
+  // UI state
+  const [uploading, setUploading] = useState(false);
+  const [minting, setMinting] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [adminChecked, setAdminChecked] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [txHash, setTxHash] = useState("");
+  const [explorerBase, setExplorerBase] = useState('https://etherscan.io');
+
+  const MAX_NAME = 150;
+  const MAX_DESC = 1500;
+  const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
+
+  // Admin list tá»« .env
+  const adminList = useMemo(() => envAdmins.split(",").map(s => s.trim().toLowerCase()).filter(Boolean), []);
+
+  // Check quyá»n: owner hoáº·c trong VITE_ADMIN_ADDRESSES
+  useEffect(() => {
+    (async () => {
+      if (!window.ethereum || !walletAddress || !contractAddress) {
+        setIsAdmin(false); setAdminChecked(true); return;
+      }
+      try {
+        const provider = new BrowserProvider(window.ethereum);
+        const signer = await provider.getSigner();
+        const contract = new Contract(contractAddress, contractABI, signer);
+        let ownerOk = false;
+        try { ownerOk = (await contract.owner?.())?.toLowerCase?.() === walletAddress.toLowerCase(); } catch {}
+        const envOk = adminList.includes(walletAddress.toLowerCase());
+        setIsAdmin(ownerOk || envOk);
+        setAdminChecked(true);
+        try {
+          const net = await provider.getNetwork();
+          setExplorerBase(getExplorerBaseByChain(net.chainId));
+        } catch {}
+      } catch {
+        setIsAdmin(false); setAdminChecked(true);
+      }
+    })();
+  }, [walletAddress, adminList]);
+
+  // Validate JSON file
+  const validateJsonFile = async (file) => {
+    const text = await file.text();
+    const json = JSON.parse(text);
+    if (!json.name) throw new Error("Metadata JSON pháº£i cÃ³ trÆ°á»ng `name`");
+    const hasIpfsImage = !!json.image?.startsWith?.("ipfs://");
+    return { json, hasIpfsImage };
+  };
+
+  // Upload metadata
+  const uploadMetadataJson = async () => {
+    if (!jsonFile && !metaName) { toast.error("Vui lÃ²ng nháº­p tiÃªu Ä‘á» chá»©ng chá»‰"); return; }
+    if (!jsonFile && !imageFile) { toast.error("Vui lÃ²ng chá»n chá»©ng chá»‰ (áº£nh/PDF)"); return; }
+    if (imageFile && imageFile.size > MAX_FILE_SIZE) { toast.error("File quÃ¡ lá»›n, tá»‘i Ä‘a 25MB"); return; }
+
+    setProgress(20);
+    let hasIpfsImage = false;
+    if (jsonFile) {
+      try { const result = await validateJsonFile(jsonFile); hasIpfsImage = result.hasIpfsImage; }
+      catch (e) { toast.error(e?.message || 'Invalid JSON'); setProgress(0); return; }
+    }
+    if (jsonFile && !hasIpfsImage && !imageFile) {
+      toast.error('Metadata JSON thiáº¿u trÆ°á»ng image dáº¡ng ipfs:// vÃ  báº¡n chÆ°a chá»n áº£nh Ä‘Ã­nh kÃ¨m');
+      setProgress(0); return;
+    }
+
+    try {
+      const apiBase = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE) || '/api';
+      const form = new FormData();
+      if (jsonFile) {
+        form.append('metadata', jsonFile);
+      } else {
+        const attributes = [];
+        if (metaCourse) attributes.push({ trait_type: 'Course', value: metaCourse });
+        if (metaScore) attributes.push({ trait_type: 'Score', value: metaScore });
+        if (metaDate) attributes.push({ trait_type: 'Issued', value: metaDate });
+        const generated = {
+          name: metaName,
+          description: metaDescription,
+          image: imageFile ? 'image' : '',
+          ...(attributes.length ? { attributes } : {})
+        };
+        const filename = `${metaName.replace(/[^a-z0-9-_. ]/gi, '_')}.json`;
+        form.append('metadata', new Blob([JSON.stringify(generated)], { type: 'application/json' }), filename);
+      }
+      if (imageFile && !(jsonFile && hasIpfsImage)) form.append('image', imageFile);
+      form.append('provider', uploader);
+
+      setUploading(true);
+      const loadingId = toast.loading('Äang táº£i lÃªn IPFS...');
+      const resp = await fetch(`${apiBase}/ipfs/upload`, { method: 'POST', body: form });
+      if (!resp.ok) {
+        let msg = `${resp.status}`;
+        try {
+          const t = await resp.text();
+          try { const j = JSON.parse(t); msg = j?.error ? (typeof j.error === 'string' ? j.error : JSON.stringify(j.error)) : (j?.message || t || msg); }
+          catch { msg = t || msg; }
+        } catch {}
+        throw new Error(`Upload lá»—i: ${msg}`);
+      }
+      const data = await resp.json();
+      if (!data?.uri) throw new Error('Missing URI');
+      setTokenURI(data.uri);
+      setProgress(60);
+      toast.update(loadingId, { render: `Táº£i lÃªn thÃ nh cÃ´ng! (${data.provider})`, type: 'success', isLoading: false, autoClose: 2000 });
+    } catch (e: any) {
+      toast.error(e.message || 'Táº£i lÃªn tháº¥t báº¡i');
+      setProgress(0);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // MINT NFT â€“ CHá»ˆ 2 THAM Sá»
+  const mintNFT = async () => {
+    if (!hasValidContract) { toast.error('ChÆ°a cáº¥u hÃ¬nh Ä‘á»‹a chá»‰ contract'); return; }
+    if (!isAdmin) { toast.error('Chá»‰ owner má»›i Ä‘Æ°á»£c mint'); return; }
+    if (!isAddress(recipient) || recipient === "0x0000000000000000000000000000000000000000") {
+      toast.error('Äá»‹a chá»‰ ngÆ°á»i nháº­n khÃ´ng há»£p lá»‡'); return;
+    }
+    if (!tokenURI) { toast.error('ChÆ°a cÃ³ Token URI'); return; }
+
+    if (!window.confirm(`XÃ¡c nháº­n mint NFT cho\n${recipient.slice(0, 6)}...${recipient.slice(-4)}?`)) return;
+
+    setProgress(70);
+    const canonical = canonicalizeTokenUri(tokenURI);
+    if (canonical !== tokenURI) setTokenURI(canonical);
+    setMinting(true);
+
+    let course = '', score = '', issued = '';
+    try {
+      const meta = await fetchJsonWithFallbacks(canonical);
+      const find = (keys: string | string[]) => {
+        const arr = Array.isArray(keys) ? keys : [keys];
+        return meta.attributes?.find((a: any) =>
+          arr.some(k => String(a.trait_type || '').trim().toLowerCase() === String(k).trim().toLowerCase())
+        )?.value || '';
+      };
+      course = find(['course', 'khÃ³a há»c', 'khoÃ¡']);
+      score = find(['score', 'Ä‘iá»ƒm', 'Ä‘iá»ƒm sá»‘']);
+      issued = find(['issued', 'ngÃ y cáº¥p', 'date', 'ngÃ y']);
+      if (!jsonFile) { course = course || metaCourse; score = score || metaScore; issued = issued || metaDate; }
+    } catch (e: any) {
+      toast.warn(`KhÃ´ng Ä‘á»c metadata Ä‘á»ƒ lÆ°u DB: ${e.message}`);
+    }
+
+    try {
+      if (!window.ethereum) throw new Error('Cáº§n MetaMask');
+      const provider = new BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const contract = new Contract(contractAddress, contractABI, signer);
+      const loadingId = toast.loading('Vui lÃ²ng xÃ¡c nháº­n trong MetaMask...');
+
+      // CHá»ˆ Gá»ŒI 2 THAM Sá»
+      const tx = await contract.mintCertificate(recipient, canonical);
+
+      setTxHash(tx.hash);
+      toast.update(loadingId, { render: 'Äang chá» xÃ¡c nháº­n...', isLoading: true });
+      const receipt = await tx.wait();
+      setProgress(100);
+
+      // Extract tokenId
+      let mintedTokenId: string | null = null;
+      try {
+        for (const log of receipt.logs || []) {
+          try {
+            const parsed = contract.interface.parseLog(log);
+            if (parsed?.name === 'Transfer') {
+              const to = String(parsed.args?.[1] || parsed.args?.to || '').toLowerCase();
+              const id = parsed.args?.[2] ?? parsed.args?.tokenId;
+              if (to === recipient.toLowerCase()) {
+                mintedTokenId = id.toString();
+                break;
+              }
+            }
+          } catch {}
+        }
+      } catch {}
+
+      if (mintedTokenId) {
+        const apiBase = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE) || '/api';
+        const payload = { tokenId: mintedTokenId, recipient, tokenURI: canonical, course, score, issuedDate: issued };
+        try { await fetch(`${apiBase}/certificates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); } catch {}
+      }
+
+      toast.update(loadingId, { render: 'ÄÃ£ mint thÃ nh cÃ´ng!', type: 'success', isLoading: false, autoClose: 3000 });
+      resetForm();
+    } catch (error: any) {
+      console.error("Mint error:", error);
+      const reason = error?.reason || error?.message || "Lá»—i khÃ´ng xÃ¡c Ä‘á»‹nh";
+      let msg = "Giao dá»‹ch tháº¥t báº¡i";
+      if (error?.code === 4001) msg = "Báº¡n Ä‘Ã£ tá»« chá»‘i giao dá»‹ch";
+      else if (reason.includes("insufficient funds")) msg = "KhÃ´ng Ä‘á»§ tiá»n gas";
+      else if (reason.includes("only owner")) msg = "Báº¡n khÃ´ng pháº£i owner cá»§a contract";
+      else msg = `Lá»—i: ${reason}`;
+      toast.error(msg);
+      setProgress(60);
+    } finally {
+      setMinting(false);
+    }
+  };
+
+  const resetForm = () => {
+    setRecipient("");
+    setTokenURI("");
+    setJsonFile(null);
+    setImageFile(null);
+    setMetaName("");
+    setMetaDescription("");
+    setMetaCourse("");
+    setMetaScore("");
+    setMetaDate("");
+    setProgress(0);
+    setTxHash("");
+  };
+
+  const renderPreview = () => {
+    if (!imageFile) return null;
+    if (imageFile.type === 'application/pdf') {
+      return <embed src={URL.createObjectURL(imageFile)} width="100%" height="300" type="application/pdf" />;
+    }
+    return <img src={URL.createObjectURL(imageFile)} className="img-fluid rounded" alt="Preview" />;
+  };
+
+  return (
+    <div className="container py-5 bg-light">
+      <div className="mint-hero">
+        <h2 className="mint-title m-0">HÃ£y táº¡o chá»©ng chá»‰ cá»§a báº¡n.</h2>
+      </div>
+
+      {!adminChecked ? (
+        <p className="text-center">Äang kiá»ƒm tra quyá»n owner...</p>
+      ) : !isAdmin ? (
+        <div className="alert alert-warning">
+          Chá»‰ owner má»›i Ä‘Æ°á»£c mint!
+          {!isConnected && (
+            <button className="btn btn-primary ms-3" onClick={connect}>Káº¿t ná»‘i vÃ­</button>
+          )}
+        </div>
+      ) : null}
+
+      <div className="row g-4 mb-4">
+        <div className="col-12 col-lg-4">
+          <div className="card mint-card">
+            <div className="card-body">
+              <div className="mint-upload-drop mb-3">
+                <p className="mb-2">KÃ©o tháº£ hoáº·c táº£i tá»‡p chá»©ng chá»‰ cá»§a báº¡n.</p>
+                <small className="text-muted">PNG, JPEG, GIF, WEBP, PDF â€¢ Tá»‘i Ä‘a 25MB</small>
+              </div>
+              <div className="d-grid">
+                <label className="btn-poap">
+                  ThÃªm chá»©ng chá»‰
+                  <input type="file" accept="image/*,.pdf" hidden onChange={(e) => setImageFile(e.target.files?.[0] || null)} />
+                </label>
+              </div>
+              {(imageFile || tokenURI) && (
+                <div className="text-center mt-3">
+                  {renderPreview()}
+                  <div className="mt-2 text-muted small">{metaName || 'Certificate'}</div>
+                </div>
+              )}
+              <hr />
+              <div className="mb-2">NÃ¢ng cao: táº£i metadata JSON</div>
+              <input type="file" accept=".json" className="form-control" onChange={(e) => setJsonFile(e.target.files?.[0] || null)} />
+            </div>
+          </div>
+        </div>
+
+        <div className="col-12 col-lg-8">
+          <div className="card mint-card">
+            <div className="card-body">
+              <div className="row g-3">
+                <div className="col-12">
+                  <label className="form-label fw-semibold">TiÃªu Ä‘á» chá»©ng chá»‰ <span className="text-danger">*</span></label>
+                  <input
+                    className="form-control"
+                    maxLength={MAX_NAME}
+                    placeholder="VÃ­ dá»¥: Flow"
+                    value={metaName}
+                    onChange={(e) => setMetaName(e.target.value.slice(0, MAX_NAME))}
+                    disabled={!!jsonFile}
+                  />
+                  <div className="counter-right">{metaName.length}/{MAX_NAME}</div>
+                </div>
+                <div className="col-12">
+                  <label className="form-label fw-semibold">MÃ´ táº£ <span className="text-danger">*</span></label>
+                  <textarea
+                    className="form-control"
+                    rows={5}
+                    maxLength={MAX_DESC}
+                    placeholder="MÃ´ táº£ ngáº¯n gá»n vá» chá»©ng chá»‰"
+                    value={metaDescription}
+                    onChange={(e) => setMetaDescription(e.target.value.slice(0, MAX_DESC))}
+                    disabled={!!jsonFile}
+                  />
+                  <div className="counter-right">{metaDescription.length}/{MAX_DESC}</div>
+                </div>
+                <div className="col-md-6">
+                  <input className="form-control" placeholder="KhÃ³a há»c" value={metaCourse} onChange={(e) => setMetaCourse(e.target.value)} disabled={!!jsonFile} />
+                </div>
+                <div className="col-md-6">
+                  <input className="form-control" placeholder="Äiá»ƒm sá»‘" value={metaScore} onChange={(e) => setMetaScore(e.target.value)} disabled={!!jsonFile} />
+                </div>
+                <div className="col-md-6">
+                  <input className="form-control" type="date" value={metaDate} onChange={(e) => setMetaDate(e.target.value)} disabled={!!jsonFile} />
+                </div>
+              </div>
+
+              <div className="d-flex align-items-center justify-content-between mt-3">
+                <div className="pill-toggle">
+                  <button type="button" className={`pill-option ${uploader === 'nftstorage' ? 'active' : ''}`} onClick={() => setUploader('nftstorage')}>NFT.Storage</button>
+                  <button type="button" className={`pill-option ${uploader === 'pinata' ? 'active' : ''}`} onClick={() => setUploader('pinata')}>Pinata</button>
+                </div>
+                <button className="btn-poap" disabled={uploading || !adminChecked || !isAdmin} onClick={uploadMetadataJson}>
+                  {uploading ? 'Äang táº£i...' : 'Táº¡o metadata & Táº£i lÃªn'}
+                </button>
+              </div>
+
+              {tokenURI && (
+                <div className="alert alert-info small mt-3">
+                  Metadata: <a href={resolveIpfs(tokenURI)} target="_blank" rel="noreferrer">{tokenURI}</a>
+                </div>
+              )}
+
+              <div className="mt-4">
+                <label className="form-label fw-semibold">NgÆ°á»i nháº­n</label>
+                <div className="input-group mb-3">
+                  <input
+                    className="form-control"
+                    placeholder="0x... Ä‘á»‹a chá»‰ ngÆ°á»i nháº­n"
+                    value={recipient}
+                    onChange={(e) => setRecipient(e.target.value)}
+                  />
+                  <button className="btn btn-outline-secondary" onClick={() => setRecipient(walletAddress || "")}>Tá»± Ä‘iá»n</button>
+                </div>
+
+                {tokenURI && (
+                  <button
+                    className="btn btn-success w-100 mb-3"
+                    onClick={mintNFT}
+                    disabled={uploading || minting}
+                  >
+                    Táº¡o & Mint cho {recipient.slice(0, 6)}... ({metaName || 'Chá»©ng chá»‰'})
+                  </button>
+                )}
+
+                {progress > 0 && (
+                  <div className="progress mb-3" style={{ height: 26 }}>
+                    <div className="progress-bar progress-bar-striped progress-bar-animated" style={{ width: `${progress}%` }}>
+                      {progress === 100 ? 'HoÃ n táº¥t!' : `${progress}%`}
+                    </div>
+                  </div>
+                )}
+
+                {txHash && (
+                  <p className="text-center">
+                    <a href={`${explorerBase}/tx/${txHash}`} target="_blank" rel="noreferrer">Xem giao dá»‹ch</a>
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
